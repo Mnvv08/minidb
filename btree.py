@@ -11,9 +11,11 @@ Balance rules (every node except the root):
   internal  >= max_internal_keys // 2 keys
 """
 import bisect
+import contextlib
 import struct
 
-from pager import PAGE_SIZE, Pager
+from pager import PAGE_SIZE
+from wal import WALPager
 
 LEAF, INTERNAL, FREE = 1, 2, 3
 NODE_HEADER = struct.Struct("<BHI")      # node type, number of keys, next page (leaf chain / free list)
@@ -58,7 +60,8 @@ class Node:
 
 
 class BTree:
-    def __init__(self, path, leaf_capacity=PAGE_SIZE, max_internal_keys=MAX_INTERNAL_KEYS):
+    def __init__(self, path, leaf_capacity=PAGE_SIZE, max_internal_keys=MAX_INTERNAL_KEYS,
+                 pager_options=None):
         # Capacities are not stored in the file: reopen a file with the values it was built with.
         if not 64 <= leaf_capacity <= PAGE_SIZE:
             raise ValueError(f"leaf_capacity must be between 64 and {PAGE_SIZE}")
@@ -73,7 +76,8 @@ class BTree:
         self.page_reads = 0            # how many pages were read (handy for showing costs)
         self.free_head = 0
         self._meta_dirty = False
-        self.pager = Pager(path)
+        self._in_txn = False
+        self.pager = WALPager(path, **(pager_options or {}))
         try:
             if self.pager.num_pages == 1:
                 self._create()
@@ -86,13 +90,47 @@ class BTree:
     # ---------- meta page ----------
 
     def _create(self):
-        if self.pager.allocate() != META_PAGE:
-            raise BTreeError("unexpected page layout in a new file")
-        root = self.pager.allocate()
-        self._write_node(root, Node(LEAF))
-        self.root = root
-        self._write_meta()
+        with self.transaction():
+            if self.pager.allocate() != META_PAGE:
+                raise BTreeError("unexpected page layout in a new file")
+            root = self.pager.allocate()
+            self._write_node(root, Node(LEAF))
+            self.root = root
+            self._write_meta()
         self.pager.flush()
+
+    # ---------- transactions ----------
+
+    @contextlib.contextmanager
+    def transaction(self):
+        """Group operations into one atomic, durable unit.
+
+        Everything inside the block commits together with a single log write and fsync, or
+        (on an exception, or a crash) not at all. Single insert/put/delete calls are
+        transactions of their own; inside a block they simply join it.
+        """
+        if self._in_txn:
+            yield
+            return
+        self.pager.begin()
+        self._in_txn = True
+        saved = (getattr(self, "root", None), self.free_head)
+        try:
+            yield
+            self._save_meta_if_dirty()
+            self.pager.commit()
+        except BaseException:
+            if self.pager._txn_pages is not None:
+                self.pager.rollback()
+            self.root, self.free_head = saved       # undo the in-memory state too
+            self._meta_dirty = False
+            raise
+        finally:
+            self._in_txn = False
+
+    def checkpoint(self):
+        """Copy committed changes into the database file and empty the log."""
+        self.pager.checkpoint()
 
     def _write_meta(self):
         page = META.pack(META_MAGIC, self.root, self.free_head).ljust(PAGE_SIZE, b"\x00")
@@ -242,14 +280,16 @@ class BTree:
         """Add a new key. Raises DuplicateKeyError if it already exists."""
         self._check_key(key)
         value = self._check_value(value)
-        self._insert_checked(key, value)
+        with self.transaction():
+            self._insert_checked(key, value)
 
     def put(self, key, value):
         """Add the key, or replace its value if it already exists."""
         self._check_key(key)
         value = self._check_value(value)          # validate first: never delete and then fail
-        self.delete(key)                          # replacing = delete + insert keeps balance rules simple
-        self._insert_checked(key, value)
+        with self.transaction():                  # delete + insert commit together or not at all
+            self.delete(key)                      # replacing = delete + insert keeps balance rules simple
+            self._insert_checked(key, value)
 
     def _insert_checked(self, key, value):
         result = self._insert(self.root, key, value)
@@ -321,6 +361,10 @@ class BTree:
     def delete(self, key):
         """Remove a key. Returns True if it existed, False if not."""
         self._check_key(key)
+        with self.transaction():
+            return self._delete_key(key)
+
+    def _delete_key(self, key):
         found = self._delete(self.root, key)
         if found:
             # The root may have been left with a single child: that child becomes the root.
